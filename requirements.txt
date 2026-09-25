@@ -1,0 +1,11 @@
+numpy==2.5.1
+scipy==1.18.0
+requests==2.32.5
+fastapi==0.141.1
+starlette==1.6.0
+pydantic==2.13.4
+uvicorn==0.52.4
+python-dotenv==1.2.3
+httpx==0.28.1
+pandas==3.0.3
+scikit-learn==1.9.0

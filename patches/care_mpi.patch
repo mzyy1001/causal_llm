@@ -1,0 +1,225 @@
+diff --git a/evaluation/self_evolving_proof_suite.py b/evaluation/self_evolving_proof_suite.py
+index b4b963e..c1eb9ae 100644
+--- a/evaluation/self_evolving_proof_suite.py
++++ b/evaluation/self_evolving_proof_suite.py
+@@ -101,6 +101,8 @@ ABLATION_POLICIES = (
+ 
+ CARE_POLICIES = (
+     "true_self_evolving_api_care",
++    "true_self_evolving_api_care_llm_judge_gate",
++    "true_self_evolving_api_care_llm_judge_score_gate",
+     "true_self_evolving_api_care_log_only",
+     "true_self_evolving_api_care_no_adaptive_planner",
+     "true_self_evolving_api_care_no_certificate",
+@@ -482,6 +484,24 @@ def _care_config_for_policy(*, config: SelfEvolvingConfig, policy: str) -> SelfE
+                 "care_certificate_margin": 0.0,
+             }
+         )
++    elif policy == "true_self_evolving_api_care_llm_judge_gate":
++        overrides.update(
++            {
++                "care_certificate_mode": "calibrated_scout",
++                "care_adaptive_planner_enabled": True,
++                "care_certificate_margin": 0.0,
++                "care_gate_authority": "llm_judge",
++            }
++        )
++    elif policy == "true_self_evolving_api_care_llm_judge_score_gate":
++        overrides.update(
++            {
++                "care_certificate_mode": "calibrated_scout",
++                "care_adaptive_planner_enabled": True,
++                "care_certificate_margin": 0.0,
++                "care_gate_authority": "llm_judge_score",
++            }
++        )
+     elif policy == "true_self_evolving_api_care_log_only":
+         overrides.update(
+             {
+diff --git a/evaluation/self_evolving_runner.py b/evaluation/self_evolving_runner.py
+index 0923e3e..589c2ec 100644
+--- a/evaluation/self_evolving_runner.py
++++ b/evaluation/self_evolving_runner.py
+@@ -276,6 +276,9 @@ def _load_config(path: str | Path) -> SelfEvolvingConfig:
+         care_certificate_margin=float(
+             payload.get("care_certificate_margin", SelfEvolvingConfig.care_certificate_margin)
+         ),
++        care_gate_authority=str(
++            payload.get("care_gate_authority", SelfEvolvingConfig.care_gate_authority)
++        ),
+     )
+ 
+ 
+diff --git a/research_tool_agent_full_pool/api_client.py b/research_tool_agent_full_pool/api_client.py
+index 189227f..098dba4 100644
+--- a/research_tool_agent_full_pool/api_client.py
++++ b/research_tool_agent_full_pool/api_client.py
+@@ -214,7 +214,10 @@ class CommonstackToolSynthesisClient:
+             "model": self.model,
+             "messages": [_chat_message(message) for message in messages],
+             "temperature": self.temperature,
+-            "max_tokens": self.max_tokens,
++            # OpenAI's current chat API rejects "max_tokens" for gpt-5.x
++            # models; "max_completion_tokens" is accepted there and by
++            # OpenAI-compatible relays (transport fix, 2026-08-24).
++            "max_completion_tokens": self.max_tokens,
+         }
+         if json_schema is not None:
+             payload["response_format"] = {
+diff --git a/research_tool_agent_full_pool/harness/orchestrator.py b/research_tool_agent_full_pool/harness/orchestrator.py
+index 82dd630..97cbfd8 100644
+--- a/research_tool_agent_full_pool/harness/orchestrator.py
++++ b/research_tool_agent_full_pool/harness/orchestrator.py
+@@ -88,6 +88,11 @@ class SelfEvolvingConfig:
+     care_certificate_mode: str = "off"
+     care_adaptive_planner_enabled: bool = False
+     care_certificate_margin: float = 0.0
++    # case-study authority swap: "deterministic" (released behavior) or
++    # "llm_judge" (an LLM authorizes, given the identical evidence
++    # components the deterministic gate scores; fail-over to the
++    # deterministic decision is logged as a controller failure)
++    care_gate_authority: str = "deterministic"
+ 
+ 
+ @dataclass
+@@ -1699,6 +1704,18 @@ def _care_certify_scout_candidate(
+         return None, certificate
+     margin = float(config.care_certificate_margin)
+     selected_certified = bool(certificate["score"] >= margin)
++    _authority = str(getattr(config, "care_gate_authority", "deterministic"))
++    if _authority in ("llm_judge", "llm_judge_score"):
++        judge_certified, judge_meta = _care_llm_judge_authorize(
++            certificate=certificate, margin=margin, config=config,
++            deterministic_decision=selected_certified,
++            authority=_authority,
++        )
++        certificate["deterministic_decision"] = (
++            "accept" if selected_certified else "reject"
++        )
++        certificate["judge"] = judge_meta
++        selected_certified = judge_certified
+     decision = "accept" if selected_certified else "reject"
+     certificate.update(
+         {
+@@ -1726,6 +1743,121 @@ def _care_certify_scout_candidate(
+     return patched_candidate, certificate
+ 
+ 
++_CARE_JUDGE_CLIENT = None
++
++
++def _care_llm_judge_authorize(
++    *, certificate: dict[str, Any], margin: float,
++    config: "SelfEvolvingConfig", deterministic_decision: bool,
++    authority: str = "llm_judge",
++) -> tuple[bool, dict[str, Any]]:
++    """Authority-swap arm: an LLM judge authorizes challenger execution.
++
++    authority == "llm_judge": the judge receives the identical
++    public-evidence components the deterministic gate scores (not the
++    gate's weighted aggregate or its verdict).
++    authority == "llm_judge_score" (2x2 completion cell, prereg
++    2026-08-24): the judge ADDITIONALLY receives the calibrated
++    aggregate (score, public_gain, public_risk) and the authorization
++    threshold, with the gate's decision rule described; the decision
++    remains the judge's. Never disclosed: the gate's own verdict.
++    Failure semantics per prereg: two attempts, then fall back to the
++    deterministic decision, logged as a controller failure.
++    """
++    global _CARE_JUDGE_CLIENT
++    import json as _json
++    import os as _os
++
++    from research_tool_agent_full_pool.api_client import (
++        CommonstackToolSynthesisClient,
++    )
++
++    if _CARE_JUDGE_CLIENT is None:
++        base = _os.environ.get(
++            "COMMONSTACK_API_ENDPOINT", "https://api.commonstack.ai/v1"
++        ).rstrip("/")
++        _CARE_JUDGE_CLIENT = CommonstackToolSynthesisClient(
++            endpoint=base + "/chat/completions",
++            model=str(config.model),
++            api_mode="chat",
++            max_tokens=400,
++            temperature=0.0,
++            timeout=120,
++            response_format_json_object=False,
++            reasoning_effort=None,
++            stream=False,
++        )
++    comps = certificate.get("components") or {}
++    evidence = {
++        "evidence_components": {k: comps.get(k) for k in sorted(comps)},
++        "public_rank": certificate.get("public_rank"),
++        "public_support_count": certificate.get("public_support_count"),
++        "scout_mode": certificate.get("scout_mode"),
++        "candidate_id": certificate.get("candidate_id"),
++        "public_selected_display_candidate_id": certificate.get(
++            "public_selected_display_candidate_id"),
++        "fused_selected_display_candidate_id": certificate.get(
++            "fused_selected_display_candidate_id"),
++    }
++    score_passage = ""
++    if authority == "llm_judge_score":
++        evidence["calibrated_aggregate_score"] = certificate.get("score")
++        evidence["public_gain"] = certificate.get("public_gain")
++        evidence["public_risk"] = certificate.get("public_risk")
++        evidence["authorization_threshold"] = margin
++        score_passage = (
++            "You are also shown the system's calibrated aggregate score "
++            "(calibrated_aggregate_score = public_gain - public_risk, a "
++            "fixed weighted combination of the evidence components). The "
++            "deterministic policy this system normally uses authorizes "
++            "exactly when the score meets authorization_threshold. The "
++            "decision remains yours.\n"
++        )
++    prompt = (
++        "You are the intervention-authorization controller in a budgeted "
++        "chemistry optimization campaign. An LLM-proposed challenger "
++        "policy wants to REPLACE the public incumbent's action this "
++        "round. You see only public evidence about the challenger "
++        "candidate. Authorize it only if the public evidence indicates "
++        "it is likely to outperform the incumbent's selection; "
++        "otherwise the incumbent's action executes.\n"
++        + score_passage
++        + "Public evidence (gain-type components support authorizing; "
++        "risk-type components — anchor_risk and missing/low-support "
++        "signals — argue against):\n"
++        + _json.dumps(evidence, default=str)
++        + '\nReply JSON ONLY: {"authorize": true|false}'
++    )
++    schema = {
++        "type": "object",
++        "additionalProperties": False,
++        "required": ["authorize"],
++        "properties": {"authorize": {"type": "boolean"}},
++    }
++    for _attempt in range(2):
++        try:
++            raw = _CARE_JUDGE_CLIENT.create_tool(
++                messages=[{"role": "user", "content": prompt}],
++                json_schema=schema, schema_name="gate_judge")
++            verdict = bool(_json.loads(
++                raw[raw.find("{"):raw.rfind("}") + 1])["authorize"])
++            return verdict, {
++                "authority": authority, "status": "ok",
++                "verdict": "accept" if verdict else "reject",
++                "deterministic_score": certificate.get("score"),
++                "agrees_with_deterministic":
++                    verdict == deterministic_decision,
++            }
++        except Exception as exc:  # noqa: BLE001
++            last_err = f"{exc.__class__.__name__}"
++    return deterministic_decision, {
++        "authority": authority, "status": "controller_failure",
++        "fallback": "deterministic", "error_type": last_err,
++        "deterministic_score": certificate.get("score"),
++        "agrees_with_deterministic": True,
++    }
++
++
+ def _care_public_intervention_certificate(
+     *,
+     candidate: dict[str, Any],

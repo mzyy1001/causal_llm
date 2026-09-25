@@ -1,0 +1,15 @@
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+external/
+data/
+outputs/
+results/
+records/
+agent_records/
+*.log
+*.egg-info/
